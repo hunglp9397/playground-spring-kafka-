@@ -4,22 +4,68 @@
 
 Hệ thống E-Commerce Order Processing đã được implement với các microservices sau:
 
-### Architecture
+### Architecture Diagram
 
 ```
-User Request → Order Service (Producer)
-                ↓
-        Topic: order.created (3 partitions)
-                ↓
-    ┌───────────┼───────────┐
-    ↓           ↓           ↓
-Inventory   Notification  Payment
-Service     Service       Service
-(group 1)   (group 2)    (group 3)
-    ↓           ↓           ↓
-order.cancelled  ✓      order.paid
-                      order.cancelled
+┌─────────────────────────────────────────────────────────────┐
+│                    User (Frontend/API)                       │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Order Service (Producer)                       │
+│  - REST API: POST /api/v1/orders                           │
+│  - Lưu order vào database (H2)                            │
+│  - Gửi event: order.created                                │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+            ┌───────────────────────┐
+            │   Kafka Cluster       │
+            │  Topic: order.created  │
+            │  Partitions: 3         │
+            │  Replication: 2        │
+            └───────────┬────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  Inventory   │ │ Notification │ │   Payment    │
+│   Service    │ │   Service    │ │   Service    │
+│              │ │              │ │              │
+│ Group:       │ │ Group:       │ │ Group:       │
+│ inventory-   │ │ notification-│ │ payment-     │
+│ service-     │ │ service-     │ │ service-     │
+│ group        │ │ group        │ │ group        │
+└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+       │                 │                 │
+       │                 │                 │
+       ▼                 ▼                 ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ order.       │ │   (Log)      │ │ order.paid   │
+│ cancelled    │ │              │ │ order.       │
+│              │ │              │ │ cancelled    │
+└──────────────┘ └──────────────┘ └──────────────┘
+       │                                    │
+       └──────────────┬─────────────────────┘
+                      ▼
+            ┌───────────────────────┐
+            │  Order Status         │
+            │  Listener             │
+            │  (order-status-group) │
+            └───────────────────────┘
 ```
+
+### Event Flow
+
+1. **User tạo order** → Order Service nhận request
+2. **Order Service** → Lưu vào database → Gửi `order.created` event
+3. **3 Services cùng nhận** `order.created` event (mỗi service có consumer group riêng)
+4. **Inventory Service** → Check inventory → Gửi `order.cancelled` nếu fail
+5. **Payment Service** → Process payment → Gửi `order.paid` hoặc `order.cancelled`
+6. **Notification Service** → Gửi email xác nhận
+7. **Order Status Listener** → Xử lý `order.paid` và `order.cancelled` events
 
 ## 🚀 Components
 
@@ -154,7 +200,7 @@ mvn spring-boot:run
 ```bash
 cd consumer
 mvn spring-boot:run
-# Runs on port 8081 (default, can be changed in application.properties)
+# Runs on port 9090 (default, can be changed in application.properties)
 ```
 
 ## 🧪 Testing
@@ -257,32 +303,163 @@ docker exec kafka1 kafka-consumer-groups \
 - Payment Service gửi `order.paid` hoặc `order.cancelled`
 - Inventory Service gửi `order.cancelled` nếu không đủ hàng
 
-## 🎯 Learning Points
+## 🎯 Learning Points - Điểm Học Tập Quan Trọng
 
-### 1. Partitioning Strategy
-- Sử dụng `orderId` làm key → messages của cùng order sẽ vào cùng partition
+### 1. Partitioning Strategy ⭐⭐⭐
+
+**Vấn đề**: Làm sao đảm bảo messages của cùng một order được xử lý theo thứ tự?
+
+**Giải pháp**: Sử dụng `orderId` làm key khi gửi message
+
+```java
+// Trong OrderService.java
+orderKafkaTemplate.send("order.created", orderId, orderDto);
+//                              ↑
+//                         orderId làm key
+```
+
+**Kết quả**:
+- Messages có cùng key → vào cùng partition
+- Consumer trong cùng partition xử lý tuần tự
 - Đảm bảo ordering cho cùng một order
 
-### 2. Consumer Groups
-- Mỗi service có group riêng → mỗi service nhận tất cả messages
-- Load balancing trong cùng một group
+**Thử nghiệm**:
+```bash
+# Gửi 10 orders với cùng userId
+# Xem logs: messages vào partition nào?
+# Messages của cùng order sẽ vào cùng partition
+```
 
-### 3. Manual Acknowledgment
-- Control tốt hơn về khi nào commit offset
+### 2. Consumer Groups ⭐⭐⭐
+
+**Vấn đề**: Làm sao để nhiều services cùng nhận tất cả messages?
+
+**Giải pháp**: Mỗi service có consumer group riêng
+
+```
+Service              Consumer Group
+─────────────────────────────────────
+Inventory Service    → inventory-service-group
+Notification Service → notification-service-group
+Payment Service      → payment-service-group
+```
+
+**Behavior**:
+- Mỗi group nhận **tất cả** messages từ topic
+- Trong cùng group: Load balancing (mỗi consumer nhận một phần)
+- Khác group: Mỗi group nhận tất cả (broadcast pattern)
+
+**Thử nghiệm**:
+```bash
+# List consumer groups
+docker exec kafka1 kafka-consumer-groups --bootstrap-server localhost:9092 --list
+
+# Xem mỗi group nhận messages như thế nào
+```
+
+### 3. Manual Acknowledgment ⭐⭐
+
+**Vấn đề**: Khi nào commit offset? Nếu commit sớm và xử lý lỗi thì sao?
+
+**Giải pháp**: Manual acknowledgment - chỉ commit sau khi xử lý thành công
+
+```java
+@KafkaListener(...)
+public void processOrder(..., Acknowledgment acknowledgment) {
+    try {
+        // Xử lý order
+        processOrderInternal(order);
+        
+        // Chỉ commit sau khi thành công
+        acknowledgment.acknowledge();
+    } catch (Exception e) {
+        // Không acknowledge → message sẽ được retry
+        throw e;
+    }
+}
+```
+
+**Lợi ích**:
+- Control tốt hơn về khi nào commit
 - Tránh mất messages khi xử lý lỗi
+- Message sẽ được retry nếu không acknowledge
 
-### 4. Dead Letter Queue
-- Xử lý messages bị lỗi sau nhiều lần retry
-- Cho phép investigate và retry manually
+### 4. Dead Letter Queue ⭐⭐
+
+**Vấn đề**: Message bị lỗi sau nhiều lần retry thì làm gì?
+
+**Giải pháp**: Gửi vào Dead Letter Queue để investigate
+
+```
+Message → Retry 1 → Retry 2 → Retry 3 → DLQ
+```
+
+**Sử dụng**:
+- Investigate failed messages
+- Manual retry sau khi fix
+- Alert operations team
+
+### 5. Idempotent Producer ⭐
+
+**Vấn đề**: Làm sao tránh duplicate messages?
+
+**Giải pháp**: Enable idempotence
+
+```java
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+```
+
+**Kết quả**: Producer đảm bảo không gửi duplicate messages
+
+### 6. JSON Serialization ⭐
+
+**Vấn đề**: Làm sao serialize/deserialize complex objects?
+
+**Giải pháp**: Sử dụng JsonSerializer/JsonDeserializer
+
+```java
+// Producer
+props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+
+// Consumer
+props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+```
+
+## 💡 Best Practices Đã Áp Dụng
+
+1. ✅ **Use meaningful keys**: orderId để đảm bảo ordering
+2. ✅ **Separate consumer groups**: Mỗi service có group riêng
+3. ✅ **Manual commit**: Control tốt hơn
+4. ✅ **Error handling**: Try-catch và retry
+5. ✅ **Dead Letter Queue**: Xử lý failed messages
+6. ✅ **Idempotent producer**: Tránh duplicates
+7. ✅ **Database persistence**: Lưu state vào database
 
 ## 🔍 Next Steps (Advanced)
 
-1. **Add Retry Mechanism**: Implement exponential backoff retry
-2. **Add Database**: Lưu orders vào database
-3. **Add Monitoring**: Metrics và alerts
-4. **Add Testing**: Unit tests và integration tests
-5. **Add Saga Pattern**: Distributed transaction handling
+### Đã Implement ✅
+
+1. ✅ **Retry Mechanism**: [RETRY_MECHANISM.md](./RETRY_MECHANISM.md) - Exponential backoff retry
+2. ✅ **Database**: [DATABASE_IMPLEMENTATION.md](./DATABASE_IMPLEMENTATION.md) - Lưu orders vào database
+3. ✅ **Saga Pattern**: [SAGA_PATTERN_IMPLEMENTATION.md](./SAGA_PATTERN_IMPLEMENTATION.md) - Distributed transaction handling
+
+### Có Thể Mở Rộng 🚀
+
+4. **Add Monitoring**: Metrics và alerts (Prometheus, Grafana)
+5. **Add Testing**: Unit tests và integration tests
 6. **Add Schema Registry**: Schema versioning và compatibility
+7. **Add Security**: SSL/TLS, SASL authentication
+8. **Add Multi-Datacenter**: Replication và disaster recovery
+
+## 📚 Tài Liệu Liên Quan
+
+- **[README.md](./README.md)** - Tổng quan project
+- **[QUICK_START.md](./QUICK_START.md)** - Hướng dẫn setup nhanh (5 phút)
+- **[LEARNING_GUIDE.md](./LEARNING_GUIDE.md)** - Hướng dẫn học từng bước (8 tuần)
+- **[KAFKA_LEARNING_PATH.md](./KAFKA_LEARNING_PATH.md)** - Lộ trình học Kafka
+- **[DATABASE_IMPLEMENTATION.md](./DATABASE_IMPLEMENTATION.md)** - Database persistence
+- **[RETRY_MECHANISM.md](./RETRY_MECHANISM.md)** - Retry mechanism với exponential backoff
+- **[SAGA_PATTERN_IMPLEMENTATION.md](./SAGA_PATTERN_IMPLEMENTATION.md)** - Saga Pattern implementation
 
 ## 📝 Notes
 
@@ -290,3 +467,12 @@ docker exec kafka1 kafka-consumer-groups \
 - Email sending chỉ log, không thực sự gửi email
 - Inventory check không thực sự query database
 - Có thể mở rộng với real database, email service, payment gateway
+
+## 📚 Tài Liệu Tham Khảo
+
+- [README.md](./README.md) - Tổng quan project
+- [QUICK_START.md](./QUICK_START.md) - Hướng dẫn setup nhanh
+- [LEARNING_GUIDE.md](./LEARNING_GUIDE.md) - Hướng dẫn học từng bước
+- [DATABASE_IMPLEMENTATION.md](./DATABASE_IMPLEMENTATION.md) - Database persistence
+- [RETRY_MECHANISM.md](./RETRY_MECHANISM.md) - Retry mechanism
+- [SAGA_PATTERN_IMPLEMENTATION.md](./SAGA_PATTERN_IMPLEMENTATION.md) - Saga Pattern
